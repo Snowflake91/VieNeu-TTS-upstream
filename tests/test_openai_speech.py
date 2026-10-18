@@ -3,6 +3,9 @@ stream slots, health, auth and the listening address. ``Engine.__init__`` runs
 for real."""
 import gc
 import logging
+import socket
+import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -77,6 +80,78 @@ def test_unread_response_still_frees_its_slot(eng):
     assert eng.active == 0
     assert eng._gate.acquire(blocking=False)
     eng._gate.release()
+
+
+class SlowTTS(FakeTTS):
+    """``input="slow"``: ~8 s of audio in 20 ms chunks, 5 ms apart."""
+
+    def infer_stream(self, text, **kw):
+        self.stream_calls.append(kw)
+        for _ in range(400 if text == "slow" else 1):
+            time.sleep(0.005)
+            yield np.zeros(960, dtype=np.float32)
+
+
+@pytest.fixture
+def server(monkeypatch):
+    """The app behind a real uvicorn on a free port: TestClient cannot hang up mid-stream."""
+    monkeypatch.delenv("VIENEU_API_KEY", raising=False)
+    monkeypatch.setattr(api, "Vieneu", lambda **kw: SlowTTS())
+    eng = api.Engine()
+    monkeypatch.setattr(api, "ENGINE", eng)
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    srv = api.uvicorn.Server(api.uvicorn.Config(api.app, log_level="warning"))
+    t = threading.Thread(target=srv.run, kwargs={"sockets": [s]}, daemon=True)
+    t.start()
+    while not srv.started:
+        time.sleep(0.01)
+    yield eng, s.getsockname()[1]
+    srv.should_exit = True
+    t.join(5)
+
+
+def _start_slow_stream(port):
+    c = socket.socket()
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    c.connect(("127.0.0.1", port))
+    body = b'{"input": "slow", "response_format": "pcm"}'
+    c.sendall(b"POST /v1/audio/speech HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+              b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
+    assert c.recv(4096)
+    return c
+
+
+def _wait_idle(eng, seconds):
+    deadline = time.monotonic() + seconds
+    while eng.active and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return eng.active == 0
+
+
+def test_client_hangup_mid_stream_frees_its_slot(server):
+    # A voice assistant cancels the reply when the user presses cancel. The
+    # stream sat suspended until a garbage collection happened to close it —
+    # 89 s to 50 min with max_streams=1, every other request getting 429.
+    eng, port = server
+    gc.disable()                                 # the leak must not depend on a lucky collection
+    try:
+        c = _start_slow_stream(port)
+        assert eng.active == 1
+        c.close()
+        assert _wait_idle(eng, 1)
+    finally:
+        gc.enable()
+
+
+def test_stalled_reader_is_dropped(server):
+    # Connected but not reading (a port-forward that never passes the close on).
+    eng, port = server
+    eng.write_timeout = 0.3
+    c = _start_slow_stream(port)
+    assert _wait_idle(eng, 4)                    # unread, its send blocked forever
+    assert eng.tts.stream_calls                  # sanity: it did start
+    c.close()
 
 
 @pytest.mark.parametrize("field, value", [
