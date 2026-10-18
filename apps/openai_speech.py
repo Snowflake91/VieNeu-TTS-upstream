@@ -48,6 +48,7 @@ Environment:
     VIENEU_MAX_STREAMS=16 (GPU)        VIENEU_QUEUE=16   VIENEU_QUEUE_TIMEOUT=10
     VIENEU_API_KEY=...  (Bearer auth; unset = open — logged as a warning when
                         HOST is not a loopback address)
+    VIENEU_WRITE_TIMEOUT=30 (s a client may stall reading before its stream is dropped)
     VIENEU_WATERMARK=1                 HOST=127.0.0.1  PORT=8000
                                        (HOST=0.0.0.0 to serve other machines; the
                                        Docker profiles set it)
@@ -69,6 +70,7 @@ import wave
 import weakref
 from typing import Any, Iterator, Optional
 
+import anyio
 import numpy as np
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -125,6 +127,7 @@ class Engine:
             self.max_streams = _env_int("VIENEU_MAX_STREAMS", cpu_default) if "VIENEU_MAX_STREAMS" in os.environ else cpu_default
         self.max_queue = _env_int("VIENEU_QUEUE", self.max_streams)
         self.queue_timeout = float(os.environ.get("VIENEU_QUEUE_TIMEOUT", "10"))
+        self.write_timeout = float(os.environ.get("VIENEU_WRITE_TIMEOUT", "30"))
         self._gate = threading.BoundedSemaphore(self.max_streams)
         self._lock = threading.Lock()
         self.active = 0
@@ -342,6 +345,36 @@ def _sse_body(chunks: Iterator[np.ndarray], fmt: str, rate: int) -> Iterator[byt
               "usage": {"output_samples": n, "sample_rate": rate, "seconds": round(n / rate, 3)}})
 
 
+class _SpeechResponse(StreamingResponse):
+    """Stops synthesis and frees the slot as soon as the response ends, however
+    it ends. When the client hangs up, Starlette cancels the body loop but never
+    closes the sync generators behind it: they stayed suspended, holding the
+    slot, until a garbage collection happened to reach them (89 s to 50 min)."""
+
+    def __init__(self, body: Iterator[bytes], chunks: Iterator[np.ndarray], write_timeout: float, **kw):
+        super().__init__(body, **kw)
+        self._gens = (body, chunks)
+        self._write_timeout = write_timeout
+
+    async def __call__(self, scope, receive, send) -> None:
+        async def timed_send(message) -> None:
+            # A reader that stalls without closing (e.g. behind a port-forward)
+            # would otherwise hold the slot for as long as the TCP buffers stay full.
+            with anyio.fail_after(self._write_timeout):
+                await send(message)
+        try:
+            await super().__call__(scope, receive, timed_send)
+        except TimeoutError:
+            log.warning("%s dropped: client read nothing for %gs", self.headers.get("x-request-id"),
+                        self._write_timeout)
+        finally:
+            # Not running: Starlette waits for the in-flight next() before it
+            # gives up on the body. Closing runs _speech_chunks' finally.
+            with anyio.CancelScope(shield=True):
+                for g in self._gens:
+                    await anyio.to_thread.run_sync(g.close)
+
+
 @app.post("/v1/audio/speech", dependencies=[Depends(_auth)])
 def speech(req: SpeechRequest):
     eng = engine()
@@ -369,10 +402,11 @@ def speech(req: SpeechRequest):
     if ignored:
         headers["X-VieNeu-Ignored"] = ",".join(ignored)
     if req.stream_format == "sse":
-        return StreamingResponse(_sse_body(chunks, fmt, req.sample_rate),
-                                 media_type="text/event-stream", headers=headers)
+        return _SpeechResponse(_sse_body(chunks, fmt, req.sample_rate), chunks, eng.write_timeout,
+                               media_type="text/event-stream", headers=headers)
     media = "audio/wav" if fmt == "wav" else "audio/pcm"
-    return StreamingResponse(_audio_body(chunks, fmt, req.sample_rate), media_type=media, headers=headers)
+    return _SpeechResponse(_audio_body(chunks, fmt, req.sample_rate), chunks, eng.write_timeout,
+                           media_type=media, headers=headers)
 
 
 # ── discovery ────────────────────────────────────────────────────────────────
